@@ -19,8 +19,10 @@ extern crate libappindicator;
 
 pub mod api;
 
+use std::thread;
+use std::sync::RwLock;
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Sender, Receiver};
 
 #[derive(Clone, Debug)]
 pub enum SystrayError {
@@ -29,8 +31,9 @@ pub enum SystrayError {
     UnknownError,
 }
 
-pub struct SystrayEvent {
-    menu_index: u32,
+pub enum SystrayEvent {
+    MenuEvent(u32),
+    Quit,
 }
 
 impl std::fmt::Display for SystrayError {
@@ -46,41 +49,50 @@ impl std::fmt::Display for SystrayError {
 pub struct Application {
     window: api::api::Window,
     menu_idx: u32,
-    callback: HashMap<u32, Callback>,
+    callback: RwLock<HashMap<u32, Callback>>,
+    tx: Sender<SystrayEvent>,
     // Each platform-specific window module will set up its own thread for
     // dealing with the OS main loop. Use this channel for receiving events from
     // that thread.
     rx: Receiver<SystrayEvent>,
 }
 
-type Callback = Box<(Fn(&mut Application) -> () + 'static)>;
+type Callback = Box<RwLock<(Fn(Sender<SystrayEvent>) -> () + Send + Sync + 'static)>>;
 
 fn make_callback<F>(f: F) -> Callback
-    where F: std::ops::Fn(&mut Application) -> () + 'static {
-    Box::new(f) as Callback
+    where F: std::ops::Fn(Sender<SystrayEvent>) -> () + Send + Sync + 'static
+{
+    Box::new(RwLock::new(f)) as Callback
 }
 
 impl Application {
     pub fn new() -> Result<Application, SystrayError> {
         let (event_tx, event_rx) = channel();
-        match api::api::Window::new(event_tx) {
-            Ok(w) => Ok(Application {
-                window: w,
-                menu_idx: 0,
-                callback: HashMap::new(),
-                rx: event_rx
-            }),
-            Err(e) => Err(e)
+        match api::api::Window::new(event_tx.clone()) {
+            Ok(w) => {
+                Ok(Application {
+                       window: w,
+                       menu_idx: 0,
+                       callback: RwLock::new(HashMap::new()),
+                       tx: event_tx,
+                       rx: event_rx,
+                   })
+            }
+            Err(e) => Err(e),
         }
     }
 
     pub fn add_menu_item<F>(&mut self, item_name: &String, f: F) -> Result<u32, SystrayError>
-        where F: std::ops::Fn(&mut Application) -> () + 'static {
+        where F: std::ops::Fn(Sender<SystrayEvent>) -> () + Send + Sync + 'static
+    {
         let idx = self.menu_idx;
         if let Err(e) = self.window.add_menu_entry(idx, item_name) {
             return Err(e);
         }
-        self.callback.insert(idx, make_callback(f));
+        self.callback
+            .get_mut()
+            .unwrap()
+            .insert(idx, make_callback(f));
         self.menu_idx += 1;
         Ok(idx)
     }
@@ -101,9 +113,13 @@ impl Application {
     pub fn set_icon_from_resource(&self, resource: &String) -> Result<(), SystrayError> {
         self.window.set_icon_from_resource(resource)
     }
-    
+
     #[cfg(not(target_os = "linux"))]
-    pub fn set_icon_from_buffer(&self, buffer: &[u8], height: u32, width: u32) -> Result<(), SystrayError> {
+    pub fn set_icon_from_buffer(&self,
+                                buffer: &[u8],
+                                height: u32,
+                                width: u32)
+                                -> Result<(), SystrayError> {
         self.window.set_icon_from_buffer(buffer, width, height)
     }
 
@@ -119,22 +135,34 @@ impl Application {
         self.window.quit()
     }
 
-    pub fn wait_for_message(&mut self) {
-        loop {
-            let msg;
-            match self.rx.recv() {
-                Ok(m) => msg = m,
-                Err(_) => {
-                    self.quit();
-                    break;
+    pub fn wait_for_message(mut self) -> Sender<SystrayEvent> {
+        let sender = self.tx.clone();
+        thread::spawn(move || {
+            loop {
+                match self.rx.recv() { 
+                    Ok(m) => {
+                        match m {
+                            SystrayEvent::MenuEvent(m) => {
+                                if self.callback.read().unwrap().contains_key(&m) {
+                                    let cb_map = self.callback.read().unwrap();
+                                    let f = cb_map.get(&m).unwrap().read().unwrap();
+                                    f(self.tx.clone());
+                                    // cb_map.insert(msg.menu_index, f);
+                                }
+                            }
+                            _ => {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        break;
+                    }
                 }
             }
-            if self.callback.contains_key(&msg.menu_index) {
-                let f = self.callback.remove(&msg.menu_index).unwrap();
-                f(self);
-                self.callback.insert(msg.menu_index, f);
-            }
-        }
+            self.quit();
+        });
+        sender
     }
 }
 
